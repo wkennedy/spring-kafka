@@ -28,6 +28,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.reactivestreams.Publisher;
 import org.reactivestreams.Subscription;
 import org.springframework.kafka.support.converter.MessagingMessageConverter;
 import org.springframework.kafka.test.condition.EmbeddedKafkaCondition;
@@ -56,6 +57,7 @@ import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException
 /**
  * @author Mark Norkin
  * @author Gary Russell
+ * @author Will Kennedy
  *
  * @since 2.3.0
  */
@@ -282,42 +284,36 @@ public class ReactiveKafkaProducerTemplateTransactionIntegrationTests {
 	}
 
 	@Test
-	public void shouldSendOneRecordTransactionallyViaTemplateAsSenderRecordAndReceiveItExactlyOnce_expectException() {
+	public void shouldSendOneRecordTransactionallyViaTemplateAsSenderRecordAndReceiveItExactlyOnceWithException() {
 		ProducerRecord<Integer, String> producerRecord =
-				new ProducerRecord<>(REACTIVE_INT_KEY_TOPIC, DEFAULT_PARTITION, DEFAULT_TIMESTAMP, DEFAULT_KEY, DEFAULT_VALUE);
+				new ProducerRecord<>(REACTIVE_INT_KEY_TOPIC, DEFAULT_PARTITION, DEFAULT_TIMESTAMP, DEFAULT_KEY,
+						DEFAULT_VALUE);
 
-		StepVerifier.create(reactiveKafkaProducerTemplate.sendTransactionally(SenderRecord.create(producerRecord, null))
+		StepVerifier.create(reactiveKafkaProducerTemplate
+				.sendTransactionally(SenderRecord.create(producerRecord, null))
 				.then())
 				.expectComplete()
-				.verify(DEFAULT_VERIFY_TIMEOUT);
+				.verify();
 
 		StepVerifier.create(reactiveKafkaConsumerTemplate
 				.receiveExactlyOnce(reactiveKafkaProducerTemplate.transactionManager())
-				.concatMap(f -> {
-					return f;
-				}))
-				.assertNext(consumerRecord -> {
-					System.out.println("consumer record value: " + consumerRecord.toString());
-					assertThat(consumerRecord.key()).isEqualTo(42);
-					assertThat(consumerRecord.offset()).isEqualTo(0);
-				})
+				.concatMap(consumerRecordFlux -> sendAndCommit(consumerRecordFlux, true))
+				.onErrorResume(error -> reactiveKafkaProducerTemplate.transactionManager().abort().then(Mono.error(error)))
+		)
+				.expectErrorMatches(throwable -> throwable instanceof KafkaException &&
+						throwable.getMessage().equals("TransactionalId reactive.transaction: Invalid transition " +
+								"attempted from state READY to state ABORTING_TRANSACTION"))
+				.verify();
+
+		StepVerifier.create(reactiveKafkaConsumerTemplate
+				.receive().doOnNext(receiverRecord -> receiverRecord.receiverOffset().acknowledge()))
+				.assertNext(receiverRecord -> assertThat(receiverRecord.value()).isEqualTo(DEFAULT_VALUE))
 				.thenCancel()
 				.verify(DEFAULT_VERIFY_TIMEOUT);
-
-		ProducerRecord<Integer, String> producerRecord_next =
-				new ProducerRecord<>(REACTIVE_INT_KEY_TOPIC, DEFAULT_PARTITION, DEFAULT_TIMESTAMP + 1, DEFAULT_KEY + 1,
-						"next data");
-
-		StepVerifier.create(reactiveKafkaProducerTemplate.sendTransactionally(SenderRecord.create(producerRecord_next, null))
-				.then())
-				.expectErrorMatches(throwable -> throwable instanceof KafkaException &&
-						throwable.getMessage().equals("TransactionalId reactive.transaction: Invalid transition attempted from state IN_TRANSACTION to state IN_TRANSACTION"))
-				.verify();
 	}
 
 	@Test
 	public void shouldSendOneRecordTransactionallyViaTemplateAsSenderRecordAndReceiveItExactlyOnce() {
-
 		ProducerRecord<Integer, String> producerRecord =
 				new ProducerRecord<>(REACTIVE_INT_KEY_TOPIC, DEFAULT_PARTITION, DEFAULT_TIMESTAMP, DEFAULT_KEY,
 						DEFAULT_VALUE);
@@ -325,88 +321,44 @@ public class ReactiveKafkaProducerTemplateTransactionIntegrationTests {
 		StepVerifier.create(reactiveKafkaProducerTemplate.sendTransactionally(SenderRecord.create(producerRecord, null))
 				.then())
 				.expectComplete()
-				.verify(DEFAULT_VERIFY_TIMEOUT);
+				.verify();
 
 		StepVerifier.create(reactiveKafkaConsumerTemplate
 				.receiveExactlyOnce(reactiveKafkaProducerTemplate.transactionManager())
-				.concatMap(f -> {
-//					 sendAndCommit(REACTIVE_INT_KEY_TOPIC, f, -1);
-					return f;
-				}))
-				.assertNext(consumerRecord -> {
-					System.out.println("First consumer record value: " + consumerRecord.toString());
-					assertThat(consumerRecord.offset()).isEqualTo(0);
-				})
-				.thenCancel()
-				.verify(DEFAULT_VERIFY_TIMEOUT);
-
-		StepVerifier.create(reactiveKafkaProducerTemplate.transactionManager().sendOffsets(Collections.singletonMap(new TopicPartition(REACTIVE_INT_KEY_TOPIC, DEFAULT_PARTITION), new OffsetAndMetadata(1)), CONSUMER_GROUP_ID)).verifyComplete();
-		StepVerifier.create(reactiveKafkaProducerTemplate.transactionManager().commit()).verifyComplete();
-
-		ProducerRecord<Integer, String> producerRecord_next =
-				new ProducerRecord<>(REACTIVE_INT_KEY_TOPIC, DEFAULT_PARTITION, DEFAULT_TIMESTAMP + 1, 43,
-						"next data");
-
-		StepVerifier.create(reactiveKafkaProducerTemplate.sendTransactionally(SenderRecord.create(producerRecord_next, null))
-				.then())
-				.expectComplete()
-				.verify(DEFAULT_VERIFY_TIMEOUT);
-
-		StepVerifier.create(reactiveKafkaConsumerTemplate
-				.receiveExactlyOnce(reactiveKafkaProducerTemplate.transactionManager())
-				.concatMap(f -> {
-					return f;
-				}))
-				.assertNext(consumerRecord -> {
-					System.out.println("Second consumer record value: " + consumerRecord.toString());
-					assertThat(consumerRecord.value()).isEqualTo("next data");
-					assertThat(consumerRecord.offset()).isEqualTo(2);
-				})
-				.thenCancel()
-				.verify(DEFAULT_VERIFY_TIMEOUT);
-	}
-
-	@Test
-	public void shouldSendOneRecordTransactionallyViaTemplateAsSenderRecordAndReceiveItExactlyOnce_inline() {
-		/*
-		Consume and process message A and produce message B such that B = F(A). Exactly once processing means that A is
-		considered consumed if and only if B is successfully produced, and vice versa.
-	 	*/
-		ProducerRecord<Integer, String> producerRecord =
-				new ProducerRecord<>(REACTIVE_INT_KEY_TOPIC, DEFAULT_PARTITION, DEFAULT_TIMESTAMP, DEFAULT_KEY,
-						DEFAULT_VALUE);
-
-		StepVerifier.create(reactiveKafkaProducerTemplate.sendTransactionally(SenderRecord.create(producerRecord, null))
-				.then())
-				.expectComplete()
-				.verify(DEFAULT_VERIFY_TIMEOUT);
-
-		StepVerifier.create(reactiveKafkaConsumerTemplate
-				.receiveExactlyOnce(reactiveKafkaProducerTemplate.transactionManager())
-				.concatMap(f -> sendAndCommit(REACTIVE_INT_KEY_TOPIC, f, -1)))
+				.concatMap(consumerRecordFlux -> sendAndCommit(consumerRecordFlux, false))
+				.onErrorResume(error -> reactiveKafkaProducerTemplate.transactionManager().abort().then(Mono.error(error)))
+		)
 				.assertNext(senderResult -> {
-					System.out.println("Sender Result: "
-							+ "topic: " + senderResult.recordMetadata().topic()
-							+ "partition: " + senderResult.recordMetadata().partition()
-							+ "offset: " + senderResult.recordMetadata().offset()
-							+ "correlation metadata: " + senderResult.correlationMetadata().toString());
-					assertThat(senderResult.recordMetadata().offset()).isEqualTo(2);
+					assertThat(senderResult.correlationMetadata().intValue()).isEqualTo(DEFAULT_KEY);
+					assertThat(senderResult.recordMetadata().offset()).isGreaterThan(0);
+				})
+				.thenCancel()
+				.verify(DEFAULT_VERIFY_TIMEOUT);
+
+		StepVerifier.create(reactiveKafkaConsumerTemplate
+				.receive().doOnNext(receiverRecord -> receiverRecord.receiverOffset().acknowledge()))
+				.assertNext(receiverRecord -> {
+					assertThat(receiverRecord.value()).isEqualTo(DEFAULT_VALUE + "xyz");
+					assertThat(receiverRecord.offset()).isGreaterThan(0);
 				})
 				.thenCancel()
 				.verify(DEFAULT_VERIFY_TIMEOUT);
 	}
 
-	private Flux<SenderResult<Integer>> sendAndCommit(String destTopic, Flux<ConsumerRecord<Integer, String>> fluxConsumerRecord, int failureKey) {
+	private Flux<SenderResult<Integer>> sendAndCommit(Flux<ConsumerRecord<Integer, String>> fluxConsumerRecord, boolean failCommit) {
 		return reactiveKafkaProducerTemplate
-				.send(fluxConsumerRecord.map(consumerRecord -> {
-					System.out.println("Processing Consumer Record: " + consumerRecord.toString());
-					return toSenderRecord(destTopic, consumerRecord);
-				})
-				.concatWith(reactiveKafkaProducerTemplate.transactionManager().commit()));
+				.send(fluxConsumerRecord.map(this::toSenderRecord)
+						.concatWith(failCommit ?
+								doThrowKafkaException() :
+								reactiveKafkaProducerTemplate.transactionManager().commit()));
 	}
 
-	private SenderRecord<Integer, String, Integer> toSenderRecord(String destTopic, ConsumerRecord<Integer, String> record) {
-		return SenderRecord.create(destTopic, record.partition(), null, record.key(), "offset: " + Long.toString(record.offset()), record.key());
+	private Publisher<? extends SenderRecord<Integer, String, Integer>> doThrowKafkaException() {
+		throw new KafkaException();
+	}
+
+	private SenderRecord<Integer, String, Integer> toSenderRecord(ConsumerRecord<Integer, String> record) {
+		return SenderRecord.create(REACTIVE_INT_KEY_TOPIC, record.partition(), null, record.key(), record.value() + "xyz", record.key());
 	}
 
 }
