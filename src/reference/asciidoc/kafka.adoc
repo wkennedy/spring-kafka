@@ -116,6 +116,34 @@ public NewTopic topic3() {
 ----
 ====
 
+Starting with version 2.6, you can omit `.partitions()` and/or `replicas()` and the broker defaults will be applied to those properties.
+The broker version must be at least 2.4.0 to support this feature - see https://cwiki.apache.org/confluence/display/KAFKA/KIP-464%3A+Defaults+for+AdminClient%23createTopic[KIP-464].
+
+====
+[source, java]
+----
+@Bean
+public NewTopic topic4() {
+    return TopicBuilder.name("defaultBoth")
+            .build();
+}
+
+@Bean
+public NewTopic topic5() {
+    return TopicBuilder.name("defaultPart")
+            .replicas(1)
+            .build();
+}
+
+@Bean
+public NewTopic topic6() {
+    return TopicBuilder.name("defaultRepl")
+            .partitions(3)
+            .build();
+}
+----
+====
+
 IMPORTANT: When using Spring Boot, a `KafkaAdmin` bean is automatically registered so you only need the `NewTopic` `@Bean` s.
 
 By default, if the broker is not available, a message is logged, but the context continues to load.
@@ -656,10 +684,29 @@ In this case, all instances receive each reply, but only the instance that sent 
 This may be useful for auto-scaling, but with the overhead of additional network traffic and the small cost of discarding each unwanted reply.
 When you use this setting, we recommend that you set the template's `sharedReplyTopic` to `true`, which reduces the logging level of unexpected replies to DEBUG instead of the default ERROR.
 
+The following is an example of configuring the reply container to use the same shared reply topic:
+
+====
+[source, java]
+----
+@Bean
+public ConcurrentMessageListenerContainer<String, String> replyContainer(
+        ConcurrentKafkaListenerContainerFactory<String, String> containerFactory) {
+
+    ConcurrentMessageListenerContainer<String, String> container = containerFactory.createContainer("topic2");
+    container.getContainerProperties().setGroupId(UUID.randomUUID().toString()); // unique
+    Properties props = new Properties();
+    props.setProperty(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "latest"); // so the new group doesn't get old replies
+    container.getContainerProperties().setKafkaConsumerProperties(props);
+    return container;
+}
+----
+====
+
 IMPORTANT: If you have multiple client instances and you do not configure them as discussed in the preceding paragraph, each instance needs a dedicated reply topic.
 An alternative is to set the `KafkaHeaders.REPLY_PARTITION` and use a dedicated partition for each instance.
 The `Header` contains a four-byte int (big-endian).
-The server must use this header to route the reply to the correct topic (`@KafkaListener` does this).
+The server must use this header to route the reply to the correct partition (`@KafkaListener` does this).
 In this case, though, the reply container must not use Kafka's group management feature and must be configured to listen on a fixed partition (by using a `TopicPartitionOffset` in its `ContainerProperties` constructor).
 
 NOTE: The `DefaultKafkaHeaderMapper` requires Jackson to be on the classpath (for the `@KafkaListener`).
@@ -2184,6 +2231,10 @@ If the function returns `null`, the handler's default `BackOff` will be used.
 |1
 |The number of records before committing pending offsets when the `ackMode` is `COUNT` or `COUNT_TIME`.
 
+|adviceChain
+|`null`
+|A chain of `Advice` objects (e.g. `MethodInterceptor` around advice) wrapping the message listener, invoked in order.
+
 |ackMode
 |BATCH
 |Controls how often offsets are committed - see <<committing-offsets>>.
@@ -2717,7 +2768,7 @@ NOTE: The `seekToBeginning` method that accepts a collection is useful, for exam
 ====
 [source, java]
 ----
-public class MyListener extends AbstractConsumerSeekAware {
+public class MyListener implements ConsumerSeekAware {
 
 ...
 
@@ -2846,6 +2897,41 @@ public class SeekToLastOnIdleListener extends AbstractConsumerSeekAware {
 }
 ----
 ====
+
+Version 2.6 added convenience methods to the abstract class:
+
+* `seekToBeginning()` - seeks all assigned partitions to the beginning
+* `seekToEnd()` - seeks all assigned partitions to the end
+* `seekToTimestamp(long time)` - seeks all assigned partitions to the offset represented by that timestamp.
+
+Example:
+
+====
+[source, java]
+----
+public class MyListener extends AbstractConsumerSeekAware {
+
+    @KafkaListener(...)
+    void listn(...) {
+        ...
+    }
+}
+
+public class SomeOtherBean {
+
+    MyListener listener;
+
+    ...
+
+    void someMethod() {
+        this.listener.seekToTimestamp(System.currentTimeMillis - 60_000);
+    }
+
+}
+
+----
+====
+
 
 [[container-factory]]
 ==== Container factory
@@ -3011,6 +3097,8 @@ Spring for Apache Kafka adds support in the following ways:
 * `KafkaTransactionManager`: Used with normal Spring transaction support (`@Transactional`, `TransactionTemplate` etc).
 * Transactional `KafkaMessageListenerContainer`
 * Local transactions with `KafkaTemplate`
+* Transaction synchronization with other transaction managers
+* `ChainedKafkaTransactionManager`
 
 Transactions are enabled by providing the `DefaultKafkaProducerFactory` with a `transactionIdPrefix`.
 In that case, instead of managing a single shared `Producer`, the factory maintains a cache of transactional producers.
@@ -3025,8 +3113,11 @@ NOTE: While transactions are supported with batch listeners, by default, zombie 
 However, starting with version 2.3.2, zombie fencing is supported if you set the container property `subBatchPerPartition` to true.
 In that case, the batch listener is invoked once per partition received from the last poll, as if each poll only returned records for a single partition.
 This is `true` by default since version 2.5 when transactions are enabled with `EOSMode.ALPHA`; set it to `false` if you are using transactions but are not concerned about zombie fencing.
+Also see <<exactly-once>>.
 
 Also see <<transaction-id-prefix>>.
+
+With Spring Boot, it is only necessary to set the `spring.kafka.producer.transaction-id-prefix` property - Boot will automatically configure a `KafkaTransactionManager` bean and wire it into the listener container.
 
 ===== Using `KafkaTransactionManager`
 
@@ -3042,52 +3133,24 @@ You must configure the `KafkaTemplate` to use the same `ProducerFactory` as the 
 
 ===== Transaction Synchronization
 
-If you need to synchronize a Kafka transaction with some other transaction, configure the listener container with the appropriate transaction manager (one that supports synchronization, such as the `DataSourceTransactionManager`).
-Any operations performed on a transactional `KafkaTemplate` from the listener participate in a single transaction.
-The Kafka transaction is committed (or rolled back) immediately after the controlling transaction.
-Before exiting the listener, you should invoke one of the template's `sendOffsetsToTransaction` methods (unless you use a <<chained-transaction-manager,`ChainedKafkaTransactionManager`>>).
-For convenience, the listener container binds its consumer group ID to the thread, so, generally, you can use the first method.
-The following listing shows the two method signatures:
+This section refers to producer-only transactions (transactions not started by a listener container); see <<chained-transaction-manager>> for information about synchronizing transactions when the container starts the transaction.
+
+If you want to send records to kafka and perform some database updates, you can use normal Spring transaction management with, say, a `DataSourceTransactionManager`.
 
 ====
 [source, java]
 ----
-void sendOffsetsToTransaction(Map<TopicPartition, OffsetAndMetadata> offsets);
-
-void sendOffsetsToTransaction(Map<TopicPartition, OffsetAndMetadata> offsets, String consumerGroupId);
-----
-====
-
-The following example shows how to use the first signature of the `sendOffsetsToTransaction` method:
-
-====
-[source, java]
-----
-@Bean
-KafkaMessageListenerContainer container(ConsumerFactory<String, String> cf,
-            final KafkaTemplate template) {
-    ContainerProperties props = new ContainerProperties("foo");
-    props.setGroupId("group");
-    props.setTransactionManager(new SomeOtherTransactionManager());
-    ...
-    props.setMessageListener((MessageListener<String, String>) m -> {
-        template.send("foo", "bar");
-        template.send("baz", "qux");
-        template.sendOffsetsToTransaction(
-            Collections.singletonMap(new TopicPartition(m.topic(), m.partition()),
-                new OffsetAndMetadata(m.offset() + 1)));
-    });
-    return new KafkaMessageListenerContainer<>(cf, props);
+@Transactional
+public void process(List<Thing> things) {
+    things.forEach(thing -> this.kafkaTemplate.send("topic", thing));
+    updateDb(things);
 }
 ----
 ====
 
-NOTE: The offset to be committed is one greater than the offset of the records processed by the listener.
-
-IMPORTANT: You should call this only when you use transaction synchronization.
-When a listener container is configured to use a `KafkaTransactionManager` or `ChainedKafkaTransactionManager`, it takes care of sending the offsets to the transaction.
-
-See <<ex-jdbc-sync>> for an example application that synchronizes JDBC and Kafka transactions.
+The interceptor for the `@Transactional` annotation starts the transaction and the `KafkaTemplate` will synchronize a transaction with that transaction manager; each send will participate in that transaction.
+When the method exits, the database transaction will commit followed by the Kafka transaction.
+If you wish the commits to be performed in the reverse order (Kafka first), use a <<chained-transaction-manager,`ChainedTransactionManager`>> configured with the `DataSourceTransactionManager` as the first TM and then the `KafkaTransactionManager`, in that order.
 
 [[chained-transaction-manager]]
 ===== Using `ChainedKafkaTransactionManager`
@@ -3098,7 +3161,7 @@ Since it is a `KafkaAwareTransactionManager`, the container can send the offsets
 This provides another mechanism for synchronizing transactions without having to send the offsets to the transaction in the listener code.
 You should chain your transaction managers in the desired order and provide the `ChainedTransactionManager` in the `ContainerProperties`.
 
-See <<ex-jdbc-sync>> for an example application that synchronizes JDBC and Kafka transactions.
+See <<ex-jdbc-sync>> for an example application that chains JDBC and Kafka transactions.
 
 Starting with version 2.5.4, you can configure a `TransactionDefinition` in the `ContainerProperties`; its properties will be copied to the container's `TransactionTemplate` used to start transactions.
 This allows, for example, setting a transaction timeout for other transaction managers within the `ChainedKafkaTransactionManager`.
@@ -3131,7 +3194,7 @@ Instead, a new "nested" transaction is used.
 ===== `transactionIdPrefix`
 
 As mentioned in <<transactions, the overview>>, the producer factory is configured with this property to build the producer `transactional.id` property.
-There is rather a dichotomy when specifying this property in that, when running multiple instances of the application, it must be the same on all instances to satisfy fencing zombies (also mentioned in the overview) when producing records on a listener container thread.
+There is a dichotomy when specifying this property in that, when running multiple instances of the application with `EOSMode.ALPHA`, it must be the same on all instances to satisfy fencing zombies (also mentioned in the overview) when producing records on a listener container thread.
 However, when producing records using transactions that are **not** started by a listener container, the prefix has to be different on each instance.
 Version 2.3, makes this simpler to configure, especially in a Spring Boot application.
 In previous versions, you had to create two producer factories and `KafkaTemplate` s - one for producing records on a listener container thread and one for stand-alone transactions started by `kafkaTemplate.executeInTransaction()` or by a transaction interceptor on a `@Transactional` method.
@@ -3139,9 +3202,12 @@ In previous versions, you had to create two producer factories and `KafkaTemplat
 Now, you can override the factory's `transactionalIdPrefix` on the `KafkaTemplate` and the `KafkaTransactionManager`.
 
 When using a transaction manager and template for a listener container, you would normally leave this to default to the producer factory's property.
-This value should be the same for all application instances.
+This value should be the same for all application instances when using `EOSMode.ALPHA`.
+With `EOSMode.BETA` it is no longer necessary to use the same `transactional.id`, even for consumer-initiated transactions; in fact, it must be unique on each instance the same as producer-initiated transactions.
 For transactions started by the template (or the transaction manager for `@Transaction`) you should set the property on the template and transaction manager respectively.
 This property must have a different value on each application instance.
+
+This problem (different rules for `transactional.id`) has been eliminated when `EOSMode.BETA` is being used (with broker versions >= 2.5); see <<exactly-once>>.
 
 [[tx-template-mixed]]
 ===== `KafkaTemplate` Transactional and non-Transactional Publishing
@@ -3246,12 +3312,14 @@ To configure the container to use mode `ALPHA`, set the container property `EOSM
 
 IMPORTANT: With `BETA`, your brokers must be version 2.5 or later, however with `kafka-clients` version 2.6, the producer will automatically fall back to `ALPHA` if the broker does not support `BETA`.
 The `DefaultKafkaProducerFactory` is configured to enable that behavior.
-If your brokers are earlier than 2.5, be sure to leave the `DefaultKafkaConsumerFactory` `producerPerConsumerPartition` set to `true` and, if you are using a batch listener, you should set `subBatchPerPartition` to `true`.
+If your brokers are earlier than 2.5, be sure to leave the `DefaultKafkaProducerFactory` `producerPerConsumerPartition` set to `true` and, if you are using a batch listener, you should set `subBatchPerPartition` to `true`.
 
 When your brokers are upgraded to 2.5 or later, the producer will automatically switch to using mode `BETA`, but the number of producers will remain as before.
 You can then do a rolling upgrade of your application with `producerPerConsumerPartition` set to `false` to reduce the number of producers; you should also no longer set the `subBatchPerPartition` container property.
 
-If your brokers are already 2.5 or newer, you should set the `DefaultKafkaConsumerFactory` `producerPerConsumerPartition` property to `false`, to reduce the number of producers needed.
+If your brokers are already 2.5 or newer, you should set the `DefaultKafkaProducerFactory` `producerPerConsumerPartition` property to `false`, to reduce the number of producers needed.
+
+IMPORTANT: When using `EOSMode.BETA` with `producerPerConsumerPartition=false` the `transactional.id` must be unique across all application instances.
 
 When using `BETA` mode, it is no longer necessary to set the `subBatchPerPartition` to `true`; it will default to `false` when the `EOSMode` is `BETA`.
 
@@ -4611,6 +4679,7 @@ The exceptions that are considered fatal, by default, are:
 
 * `DeserializationException`
 * `MessageConversionException`
+* `ConversionException`
 * `MethodArgumentResolutionException`
 * `NoSuchMethodException`
 * `ClassCastException`
@@ -4863,6 +4932,7 @@ The exceptions that are considered fatal, by default, are:
 
 * `DeserializationException`
 * `MessageConversionException`
+* `ConversionException`
 * `MethodArgumentResolutionException`
 * `NoSuchMethodException`
 * `ClassCastException`

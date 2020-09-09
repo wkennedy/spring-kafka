@@ -108,6 +108,7 @@ import org.springframework.transaction.support.TransactionCallbackWithoutResult;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.util.Assert;
+import org.springframework.util.ClassUtils;
 import org.springframework.util.StringUtils;
 import org.springframework.util.concurrent.ListenableFuture;
 import org.springframework.util.concurrent.ListenableFutureCallback;
@@ -139,6 +140,8 @@ public class KafkaMessageListenerContainer<K, V> // NOSONAR line count
 	private static final String UNUSED = "unused";
 
 	private static final int DEFAULT_ACK_TIME = 5000;
+
+	private static final Map<String, Object> CONSUMER_CONFIG_DEFAULTS = ConsumerConfig.configDef().defaultValues();
 
 	private final AbstractMessageListenerContainer<K, V> thisOrParentContainer;
 
@@ -433,8 +436,6 @@ public class KafkaMessageListenerContainer<K, V> // NOSONAR line count
 
 		private static final String ERROR_HANDLER_THREW_AN_EXCEPTION = "Error handler threw an exception";
 
-		private static final int SIXTY = 60;
-
 		private static final String UNCHECKED = "unchecked";
 
 		private static final String RAWTYPES = "rawtypes";
@@ -658,8 +659,8 @@ public class KafkaMessageListenerContainer<K, V> // NOSONAR line count
 				this.logger.info(this.toString());
 			}
 			Map<String, Object> props = KafkaMessageListenerContainer.this.consumerFactory.getConfigurationProperties();
-			this.checkNullKeyForExceptions = checkDeserializer(findDeserializerClass(props, false));
-			this.checkNullValueForExceptions = checkDeserializer(findDeserializerClass(props, true));
+			this.checkNullKeyForExceptions = checkDeserializer(findDeserializerClass(props, consumerProperties, false));
+			this.checkNullValueForExceptions = checkDeserializer(findDeserializerClass(props, consumerProperties, true));
 			this.syncCommitTimeout = determineSyncCommitTimeout();
 			if (this.containerProperties.getSyncCommitTimeout() == null) {
 				// update the property so we can use it directly from code elsewhere
@@ -678,12 +679,13 @@ public class KafkaMessageListenerContainer<K, V> // NOSONAR line count
 
 		private Properties propertiesFromProperties() {
 			Properties propertyOverrides = this.containerProperties.getKafkaConsumerProperties();
-			Properties props = new Properties(propertyOverrides);
-			Set<String> stringPropertyNames = props.stringPropertyNames();
-			// Copy non-string-valued properties from the default hash table to the new properties object
-			propertyOverrides.forEach((key, value) -> {
-				if (key instanceof String && !stringPropertyNames.contains(key)) {
-					props.put(key, value);
+			Properties props = new Properties();
+			props.putAll(propertyOverrides);
+			Set<String> stringPropertyNames = propertyOverrides.stringPropertyNames();
+			// User might have provided properties as defaults
+			stringPropertyNames.forEach((name) -> {
+				if (!props.contains(name)) {
+					props.setProperty(name, propertyOverrides.getProperty(name));
 				}
 			});
 			return props;
@@ -783,9 +785,9 @@ public class KafkaMessageListenerContainer<K, V> // NOSONAR line count
 					this.logger.warn(() -> "Unexpected type: " + timeoutToLog.getClass().getName()
 							+ " in property '"
 							+ ConsumerConfig.MAX_POLL_INTERVAL_MS_CONFIG
-							+ "'; defaulting to 30 seconds.");
+							+ "'; using Kafka default.");
 				}
-				return Duration.ofSeconds(SIXTY / 2).toMillis(); // Default 'max.poll.interval.ms' is 30 seconds
+				return (int) CONSUMER_CONFIG_DEFAULTS.get(ConsumerConfig.MAX_POLL_INTERVAL_MS_CONFIG);
 			}
 		}
 
@@ -868,22 +870,29 @@ public class KafkaMessageListenerContainer<K, V> // NOSONAR line count
 						this.logger.warn(() -> "Unexpected type: " + timeoutToLog.getClass().getName()
 							+ " in property '"
 							+ ConsumerConfig.DEFAULT_API_TIMEOUT_MS_CONFIG
-							+ "'; defaulting to 60 seconds for sync commit timeouts");
+							+ "'; defaulting to Kafka default for sync commit timeouts");
 					}
-					return Duration.ofSeconds(SIXTY);
+					return Duration
+							.ofMillis((int) CONSUMER_CONFIG_DEFAULTS.get(ConsumerConfig.DEFAULT_API_TIMEOUT_MS_CONFIG));
 				}
 			}
-
 		}
 
-		private Object findDeserializerClass(Map<String, Object> props, boolean isValue) {
+		@Nullable
+		private Object findDeserializerClass(Map<String, Object> props, Properties consumerOverrides, boolean isValue) {
 			Object configuredDeserializer = isValue
 					? KafkaMessageListenerContainer.this.consumerFactory.getValueDeserializer()
 					: KafkaMessageListenerContainer.this.consumerFactory.getKeyDeserializer();
 			if (configuredDeserializer == null) {
-				return props.get(isValue
+				Object deser = consumerOverrides.get(isValue
 						? ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG
 						: ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG);
+				if (deser == null) {
+					deser = props.get(isValue
+							? ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG
+							: ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG);
+				}
+				return deser;
 			}
 			else {
 				return configuredDeserializer.getClass();
@@ -915,10 +924,23 @@ public class KafkaMessageListenerContainer<K, V> // NOSONAR line count
 			}
 		}
 
-		private boolean checkDeserializer(Object deser) {
-			return deser instanceof Class
-					? ErrorHandlingDeserializer.class.isAssignableFrom((Class<?>) deser)
-					: deser instanceof String && deser.equals(ErrorHandlingDeserializer.class.getName());
+		private boolean checkDeserializer(@Nullable Object deser) {
+			Class<?> deserializer = null;
+			if (deser instanceof Class) {
+				deserializer = (Class<?>) deser;
+			}
+			else if (deser instanceof String) {
+				try {
+					deserializer = ClassUtils.forName((String) deser, getApplicationContext().getClassLoader());
+				}
+				catch (ClassNotFoundException | LinkageError e) {
+					throw new IllegalStateException(e);
+				}
+			}
+			else if (deser != null) {
+				throw new IllegalStateException("Deserializer must be a class or class name, not a " + deser.getClass());
+			}
+			return deserializer == null ? false : ErrorHandlingDeserializer.class.isAssignableFrom(deserializer);
 		}
 
 		protected void checkConsumer() {
@@ -1074,6 +1096,9 @@ public class KafkaMessageListenerContainer<K, V> // NOSONAR line count
 			}
 			pauseConsumerIfNecessary();
 			this.lastPoll = System.currentTimeMillis();
+			if (!isRunning()) {
+				return;
+			}
 			this.polling.set(true);
 			ConsumerRecords<K, V> records = doPoll();
 			if (!this.polling.compareAndSet(true, false) && records != null) {
